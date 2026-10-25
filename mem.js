@@ -208,13 +208,34 @@ function readInto(dest, addr, count) {
     const chunk = Math.min(count - done, carrier.windowBytes);
     aimFor(base + done, chunk);
     try {
-      for (let i = 0; i < chunk; ++i) dest[done + i] = carrier.view[i];
+      const view = carrier.view;
+      for (let i = 0; i < chunk; ++i) dest[done + i] = view[i];
     } finally {
       carrier.restore();
     }
     done += chunk;
   }
   return dest;
+}
+
+// Batched mirror of readInto: writes count bytes from src through the
+// carrier window in windowBytes-sized chunks, one aim/restore per chunk
+// instead of one per single-byte access. Byte-for-byte identical to the
+// equivalent sequence of write1 calls.
+function writeFrom(src, addr, count) {
+  const base = addrNumber(addr);
+  let done = 0;
+  while (done < count) {
+    const chunk = Math.min(count - done, carrier.windowBytes);
+    aimFor(base + done, chunk);
+    try {
+      const view = carrier.view;
+      for (let i = 0; i < chunk; ++i) view[i] = src[done + i];
+    } finally {
+      carrier.restore();
+    }
+    done += chunk;
+  }
 }
 
 const WORKER_BUFFER_SIZE = 0x100;
@@ -921,6 +942,7 @@ export {
   write8,
   leakval,
   readInto,
+  writeFrom,
   toI64,
   addrNumber,
   int64,
