@@ -127,9 +127,29 @@
       code {
         color: #9fb3d0;
       }
+
+      /* Live RAM/heap HUD, top-left. jb.js fills it every 500 ms. */
+      #ramBox {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        z-index: 9999;
+        padding: 6px 9px;
+        color: #7fd0a0;
+        background: rgba(0, 0, 0, 0.78);
+        border: 1px solid #1e2732;
+        border-radius: 4px;
+        font-family: Consolas, monospace;
+        font-size: 11px;
+        max-width: 92vw;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
     </style>
   </head>
   <body>
+    <div id="ramBox">RAM: checking...</div>
     <div id="brand"><b>ZALWEBPLOIT</b></div>
     <div id="spin"></div>
     <div id="msg">Restart your console</div>
@@ -138,7 +158,7 @@
       <div id="out"></div>
     </div>
     <script type="module">
-      import "./jb.js?v=20";
+      import "./jb.js?v=30";
     </script>
   </body>
 </html>
